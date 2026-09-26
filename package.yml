@@ -1,0 +1,134 @@
+name: whisper-cpp
+title: whisper.cpp
+summary: Transcribes and translates speech on the CPU with whisper.cpp, writing text, SRT, VTT or JSON. Whisper models are not included.
+homepage: https://github.com/ggml-org/whisper.cpp
+# whisper.cpp and ggml (MIT), and what the tools compile in with them:
+# miniaudio (MIT-0 or Unlicense), stb_vorbis (MIT or public domain, used
+# under MIT), and cpp-httplib and nlohmann/json (MIT) in whisper-server.
+license: MIT AND (MIT-0 OR Unlicense)
+upstream:
+  source: github-tag
+  repository: ggml-org/whisper.cpp
+  # Release tags look like v1.9.4. whisper.cpp marks some releases as
+  # pre-releases, so tags are read instead of GitHub releases.
+  tag-pattern: '^v(\d+\.\d+\.\d+)$'
+  version-template: '{1}'
+  versioning: semver
+  version: 1.9.4
+  # No release tarball or checksums are published, so the build clones the tag.
+  git:
+    url: https://github.com/ggml-org/whisper.cpp.git
+    tag: v{version}
+    commit: 927cfce34f31707e17f2bff35c349632fb9e2c3a
+image:
+  entrypoint: [whisper-cli]
+  cmd: [--help]
+test:
+  - |
+    whisper-cli --version > version.txt 2> /dev/null
+    test "$(cat version.txt)" = "whisper.cpp version: $VERSION"
+    for tool in whisper-bench whisper-quantize whisper-server whisper-vad-speech-segments parakeet-cli parakeet-quantize; do
+      command -v "$tool" > /dev/null || { echo "missing: $tool" >&2; exit 1; }
+    done
+    for tool in whisper-bench whisper-server whisper-vad-speech-segments parakeet-cli; do
+      "$tool" --help > /dev/null 2> help.txt || { cat help.txt >&2; echo "$tool --help failed" >&2; exit 1; }
+    done
+  - |
+    # The CPU backend is built once per instruction set level, down to a
+    # baseline that runs on any CPU of the architecture, and the tools load
+    # the best module for the CPU from /usr/local/lib.
+    case "$(uname -m)" in
+      x86_64) baseline=x64 ;;
+      aarch64) baseline=armv8.0_1 ;;
+      *) echo "unexpected architecture: $(uname -m)" >&2; exit 1 ;;
+    esac
+    test -f "/usr/local/lib/libggml-cpu-$baseline.so"
+    whisper-cli --version > /dev/null 2> backend.txt
+    grep -Eq '^load_backend: loaded CPU backend from /usr/local/lib/libggml-cpu-[a-z0-9_.]+\.so$' backend.txt \
+      || { cat backend.txt >&2; exit 1; }
+    test "$(grep -c '^load_backend: loaded' backend.txt)" -eq 1
+  - |
+    # A multilingual tiny model without weights, laid out like upstream's
+    # models/for-tests-ggml-tiny.bin: the hyperparameters, 80x201 zero mel
+    # filters and a one-token vocabulary. whisper.cpp runs the encoder and
+    # decoder on the CPU backend and writes an empty transcript.
+    {
+      printf 'lmgg\231\312\000\000\334\005\000\000\200\001\000\000\006\000\000\000\004\000\000\000'
+      printf '\300\001\000\000\200\001\000\000\006\000\000\000\004\000\000\000\120\000\000\000\001\000\000\000'
+      printf '\120\000\000\000\311\000\000\000'
+      head -c 64320 /dev/zero
+      printf '\001\000\000\000\001\000\000\000 '
+    } > tiny.bin
+    # One second of 16 kHz 16-bit mono silence.
+    {
+      printf 'RIFF\044\175\000\000WAVEfmt \020\000\000\000\001\000\001\000'
+      printf '\200\076\000\000\000\175\000\000\002\000\020\000data\000\175\000\000'
+      head -c 32000 /dev/zero
+    } > silence.wav
+    whisper-cli -m tiny.bin -l en -t 2 -f silence.wav -oj -of silence 2> silence.log || { cat silence.log >&2; exit 1; }
+    grep -Fq "processing 'silence.wav' (16000 samples, 1.0 sec)" silence.log || { cat silence.log >&2; exit 1; }
+    grep -Fq '"type": "tiny"' silence.json
+    grep -Fq '"vocab": 51865' silence.json
+    grep -Fq '"language": "en"' silence.json
+  - |
+    # whisper-cli decodes MP3 itself and resamples it to 16 kHz. These are 40
+    # silent MPEG-1 Layer III frames at 44.1 kHz, 1.04 seconds.
+    i=0
+    while [ "$i" -lt 40 ]; do printf '\377\373\220\300'; head -c 413 /dev/zero; i=$((i + 1)); done > silence.mp3
+    whisper-cli -m tiny.bin -l en -t 2 -f silence.mp3 -otxt -of mp3 2> mp3.log || { cat mp3.log >&2; exit 1; }
+    grep -Eq "processing 'silence\.mp3' \([0-9]+ samples, 1\.0 sec\)" mp3.log || { cat mp3.log >&2; exit 1; }
+    test -f mp3.txt
+  - |
+    # -f - reads the audio from stdin.
+    whisper-cli -m tiny.bin -l en -t 2 -f - -osrt -of stdin < silence.wav 2> stdin.log || { cat stdin.log >&2; exit 1; }
+    grep -Fq 'read 32044 bytes from stdin' stdin.log || { cat stdin.log >&2; exit 1; }
+    grep -Fq "processing '-' (16000 samples, 1.0 sec)" stdin.log
+    test -f stdin.srt
+  - |
+    whisper-quantize tiny.bin tiny-q8_0.bin q8_0 > quantize.log 2>&1 || { cat quantize.log >&2; exit 1; }
+    test "$(wc -c < tiny-q8_0.bin)" -eq "$(wc -c < tiny.bin)"
+examples:
+  - title: Transcribe a WAV file with a model from the models directory
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/whisper-cpp -m models/ggml-base.en.bin -f input.wav
+  - title: Write subtitles as input.srt
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/whisper-cpp -m models/ggml-base.en.bin -f input.wav -osrt -of input
+  - title: Translate German speech into English text
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/whisper-cpp -m models/ggml-base.bin -l de -tr -f input.mp3 -otxt -of input.en
+  - title: Transcribe the audio track of a video, converted by FFmpeg (default image)
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint sh ghcr.io/randomcontainers/whisper-cpp -c 'ffmpeg -loglevel error -i input.mp4 -vn -ar 16000 -ac 1 -f wav - | whisper-cli -m models/ggml-base.en.bin -f - -osrt -of input'
+combos:
+  - with: [ffmpeg]
+    default: true
+    base: ffmpeg
+    summary: whisper.cpp with FFmpeg, for transcribing video files and audio formats that whisper-cli cannot read, such as AAC and Opus.
+    test:
+      - |
+        # The weightless tiny model from the whisper-cpp tests.
+        {
+          printf 'lmgg\231\312\000\000\334\005\000\000\200\001\000\000\006\000\000\000\004\000\000\000'
+          printf '\300\001\000\000\200\001\000\000\006\000\000\000\004\000\000\000\120\000\000\000\001\000\000\000'
+          printf '\120\000\000\000\311\000\000\000'
+          head -c 64320 /dev/zero
+          printf '\001\000\000\000\001\000\000\000 '
+        } > tiny.bin
+        run() { ffmpeg -hide_banner -loglevel error -y "$@"; }
+        run -f lavfi -i testsrc2=size=160x120:rate=10:duration=3 -f lavfi -i sine=frequency=440:duration=3 \
+          -c:v libx264 -c:a aac -shortest clip.mp4
+        run -f lavfi -i sine=frequency=440:duration=2 -c:a libopus tone.opus
+        # FFmpeg writes a WAV header without sizes to a pipe, which whisper-cli
+        # reads up to the end of the input.
+        for pair in clip.mp4:3 tone.opus:2; do
+          file="${pair%%:*}"
+          if ! run -i "$file" -vn -ar 16000 -ac 1 -c:a pcm_s16le -f wav - \
+            | whisper-cli -m tiny.bin -l en -t 2 -f - -osrt -of "$file" 2> "$file.log"; then
+            cat "$file.log" >&2
+            exit 1
+          fi
+          grep -Eq "processing '-' \([0-9]+ samples, ${pair#*:}\.0 sec\)" "$file.log" || { cat "$file.log" >&2; exit 1; }
+          test -f "$file.srt"
+        done
+      - |
+        # whisper-server --convert runs ffmpeg -version at startup and exits
+        # when that fails. With a missing model it stops after the check.
+        if whisper-server -m missing.bin --convert > server.log 2>&1; then cat server.log >&2; exit 1; fi
+        grep -Fxq 'ffmpeg is available.' server.log || { cat server.log >&2; exit 1; }
