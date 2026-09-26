@@ -1,0 +1,132 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=ubuntu:26.04
+
+FROM ${BASE_IMAGE} AS build
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
+# The base image's packages are recorded before anything is installed, so that
+# runtime-deps can leave them out. Every image that installs runtime-deps is
+# built on the same base.
+RUN dpkg-query -W -f '${Package}\n' | sort -u > /tmp/base-packages \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      cmake \
+      git \
+ && rm -rf /var/lib/apt/lists/*
+
+# whisper.cpp publishes no release tarball or checksums, so the release tag is
+# cloned and must point to the commit pinned in package.yml.
+ARG VERSION
+ARG SOURCE_COMMIT
+RUN set -eu; \
+    printf '%s\n' "${SOURCE_COMMIT}" | grep -Eqx '[0-9a-f]{40}' \
+      || { echo "SOURCE_COMMIT must be a full commit id" >&2; exit 1; }; \
+    git -c advice.detachedHead=false clone --quiet --depth 1 --branch "v${VERSION}" \
+      https://github.com/ggml-org/whisper.cpp.git /src/whisper.cpp; \
+    test "$(git -C /src/whisper.cpp rev-parse HEAD)" = "${SOURCE_COMMIT}" \
+      || { echo "tag v${VERSION} is not commit ${SOURCE_COMMIT}" >&2; exit 1; }
+WORKDIR /src/whisper.cpp
+ARG JOBS
+# GGML_NATIVE=OFF and GGML_CPU_ALL_VARIANTS compile the CPU backend once per
+# instruction set level instead of for the runner's CPU. The variants are
+# modules in /usr/local/lib, and the tools load the best one the CPU supports
+# when they start. WHISPER_BUILD_IS_DEV=OFF drops the -dev suffix that the
+# version string otherwise has even at a release tag.
+RUN set -eu; \
+    cmake -S . -B build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DCMAKE_INSTALL_LIBDIR=lib \
+      -DBUILD_SHARED_LIBS=ON \
+      -DGGML_NATIVE=OFF \
+      -DGGML_BACKEND_DL=ON \
+      -DGGML_CPU_ALL_VARIANTS=ON \
+      -DGGML_BACKEND_DIR=/usr/local/lib \
+      -DGGML_OPENMP=ON \
+      -DGGML_CCACHE=OFF \
+      -DWHISPER_BUILD_IS_DEV=OFF \
+      -DWHISPER_BUILD_TESTS=OFF \
+      -DWHISPER_BUILD_EXAMPLES=ON \
+      -DWHISPER_BUILD_SERVER=ON \
+      -DWHISPER_ALL_WARNINGS=OFF \
+      -DWHISPER_COMMON_FFMPEG=OFF \
+      -DWHISPER_CURL=OFF \
+      -DWHISPER_SDL2=OFF; \
+    cmake --build build -j"${JOBS:-$(nproc)}"; \
+    DESTDIR=/out cmake --install build --strip; \
+    rm -rf /out/usr/local/include /out/usr/local/lib/cmake /out/usr/local/lib/pkgconfig
+
+ARG BASE_IMAGE
+# The license texts of miniaudio and stb_vorbis are at the end of their
+# sources. cpp-httplib and nlohmann/json, which only whisper-server uses,
+# name their copyright holders and the MIT license at the start of theirs,
+# and the MIT terms are added from whisper.cpp's LICENSE. runtime-deps
+# lists the packages that own the libraries the tools and CPU backends
+# load, minus the base image's packages, plus the packages in
+# runtime-deps.ubuntu.
+RUN --mount=type=bind,source=runtime-deps.ubuntu,target=/tmp/runtime-deps.extra \
+    set -eu; \
+    meta=/out/usr/local/share/randomcontainers/whisper-cpp; \
+    mkdir -p "$meta/licenses"; \
+    cp LICENSE "$meta/licenses/LICENSE"; \
+    sed -n '/^This software is available as a choice of the following licenses/,/^\*\//p' examples/miniaudio.h \
+      | sed '$d' > "$meta/licenses/LICENSE.miniaudio"; \
+    grep -q 'MIT No Attribution' "$meta/licenses/LICENSE.miniaudio"; \
+    sed -n '/^This software is available under 2 licenses/,/^\*\//p' examples/stb_vorbis.c \
+      | sed '$d' > "$meta/licenses/LICENSE.stb_vorbis"; \
+    grep -q 'ALTERNATIVE A - MIT License' "$meta/licenses/LICENSE.stb_vorbis"; \
+    sed -n '/^Permission is hereby granted/,$p' LICENSE > /tmp/mit-terms; \
+    grep -q '^THE SOFTWARE IS PROVIDED "AS IS"' /tmp/mit-terms; \
+    sed -n '1,/MIT License/p' examples/server/httplib.h > "$meta/licenses/LICENSE.httplib"; \
+    grep -q 'Copyright' "$meta/licenses/LICENSE.httplib"; \
+    sed -n '1,/SPDX-License-Identifier: MIT/p' examples/json.hpp > "$meta/licenses/LICENSE.json"; \
+    grep -q 'SPDX-FileCopyrightText' "$meta/licenses/LICENSE.json"; \
+    for f in LICENSE.httplib LICENSE.json; do \
+      { echo; cat /tmp/mit-terms; } >> "$meta/licenses/$f"; \
+    done; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://github.com/ggml-org/whisper.cpp.git@${SOURCE_COMMIT}" \
+      "https://github.com/ggml-org/whisper.cpp/tree/${SOURCE_COMMIT}" \
+      > "$meta/source"; \
+    LD_LIBRARY_PATH=/out/usr/local/lib /out/usr/local/bin/whisper-cli --version > /tmp/whisper-version 2> /dev/null; \
+    grep -Fqx "whisper.cpp version: ${VERSION}" /tmp/whisper-version || { cat /tmp/whisper-version >&2; exit 1; }; \
+    for f in /out/usr/local/lib/libggml-cpu-*.so; do echo "${f##*/}"; done > /tmp/cpu-backends; \
+    test -f "/out/usr/local/lib/$(head -n 1 /tmp/cpu-backends)"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(cc --version | head -n 1)"; \
+      echo "commit: ${SOURCE_COMMIT}"; \
+      echo "cpu backends:"; \
+      sed 's/^/  /' /tmp/cpu-backends; \
+      cat /tmp/whisper-version; \
+    } > "$meta/buildinfo"; \
+    find /out/usr/local -type f \( -perm -u+x -o -name '*.so*' \) -print0 \
+      | xargs -0 env LD_LIBRARY_PATH=/out/usr/local/lib ldd > /tmp/ldd 2>&1 || true; \
+    if grep 'not found' /tmp/ldd; then exit 1; fi; \
+    awk '$2 == "=>" && $3 ~ /^\// && $3 !~ /^\/out\// { print $3 }' /tmp/ldd | sort -u > /tmp/libs; \
+    test -s /tmp/libs; \
+    while read -r lib; do \
+      real="$(readlink -f "$lib")"; \
+      dpkg-query --search "*${real#/usr}"; \
+    done < /tmp/libs | cut -d: -f1 | sort -u | comm -23 - /tmp/base-packages > /tmp/elf-deps; \
+    sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+ARG DEBIAN_FRONTEND=noninteractive
+COPY --link --from=build /out/usr/local/ /usr/local/
+RUN set -eu; \
+    apt-get update; \
+    xargs apt-get install -y --no-install-recommends ca-certificates tini < /usr/local/share/randomcontainers/whisper-cpp/runtime-deps; \
+    rm -rf /var/lib/apt/lists/*; \
+    ldconfig; \
+    install -d -m 1777 /work /cache
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "whisper-cli"]
+CMD ["--help"]
