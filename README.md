@@ -16,8 +16,6 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" \
   ghcr.io/randomcontainers/whisper-cpp -m models/ggml-base.en.bin -f input.wav
 ```
 
-The same images can also be pulled as `randomcontainers.com/whisper-cpp`.
-
 whisper-cli prints the transcript with timestamps. `-osrt -of input` also writes it to `input.srt`; `-ovtt`, `-otxt`, `-ocsv`, `-olrc` and `-oj` (JSON) write the other formats, and several can be given at once:
 
 ```sh
