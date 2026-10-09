@@ -35,18 +35,18 @@ test:
     done
   - |
     # The CPU backend is built once per instruction set level, down to a
-    # baseline that runs on any CPU of the architecture, and the tools load
-    # the best module for the CPU from /usr/local/lib.
+    # baseline that runs on any CPU of the architecture. Test 3 checks that
+    # whisper-cli loads one of these modules.
     case "$(uname -m)" in
       x86_64) baseline=x64 ;;
       aarch64) baseline=armv8.0_1 ;;
       *) echo "unexpected architecture: $(uname -m)" >&2; exit 1 ;;
     esac
-    test -f "/usr/local/lib/libggml-cpu-$baseline.so"
-    whisper-cli --version > /dev/null 2> backend.txt
-    grep -Eq '^load_backend: loaded CPU backend from /usr/local/lib/libggml-cpu-[a-z0-9_.]+\.so$' backend.txt \
-      || { cat backend.txt >&2; exit 1; }
-    test "$(grep -c '^load_backend: loaded' backend.txt)" -eq 1
+    set -- /usr/local/lib/libggml-cpu-*.so
+    if [ ! -f "/usr/local/lib/libggml-cpu-$baseline.so" ] || [ "$#" -lt 2 ]; then
+      echo "expected libggml-cpu-$baseline.so and the other levels in /usr/local/lib, found: $*" >&2
+      exit 1
+    fi
   - |
     # A multilingual tiny model without weights, laid out like upstream's
     # models/for-tests-ggml-tiny.bin: the hyperparameters, 80x201 zero mel
@@ -67,6 +67,11 @@ test:
     } > silence.wav
     whisper-cli -m tiny.bin -l en -t 2 -f silence.wav -oj -of silence 2> silence.log || { cat silence.log >&2; exit 1; }
     grep -Fq "processing 'silence.wav' (16000 samples, 1.0 sec)" silence.log || { cat silence.log >&2; exit 1; }
+    # whisper-cli loads the backends after checking its arguments and input
+    # files: exactly one CPU module, the best for this CPU, from /usr/local/lib.
+    grep -Eq '^load_backend: loaded CPU backend from /usr/local/lib/libggml-cpu-[a-z0-9_.]+\.so$' silence.log \
+      || { cat silence.log >&2; exit 1; }
+    test "$(grep -c '^load_backend: loaded' silence.log)" -eq 1 || { cat silence.log >&2; exit 1; }
     grep -Fq '"type": "tiny"' silence.json
     grep -Fq '"vocab": 51865' silence.json
     grep -Fq '"language": "en"' silence.json
