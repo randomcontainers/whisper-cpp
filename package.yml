@@ -14,12 +14,12 @@ upstream:
   tag-pattern: '^v(\d+\.\d+\.\d+)$'
   version-template: '{1}'
   versioning: semver
-  version: 1.9.5
+  version: 1.9.6
   # No release tarball or checksums are published, so the build clones the tag.
   git:
     url: https://github.com/ggml-org/whisper.cpp.git
     tag: v{version}
-    commit: d1be6fde11ac6e0407606b4e42fe72d34add8037
+    commit: 96ec4d9823e9d0211944172da35f9f29134af990
 image:
   entrypoint: [whisper-cli]
   cmd: [--help]
